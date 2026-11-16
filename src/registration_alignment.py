@@ -6,6 +6,20 @@ from config import PROCESSED_DATA_DIR
 
 
 # ==========================================
+# CONFIGURATION
+# ==========================================
+
+PAGE_WIDTH = 595.2756
+PAGE_HEIGHT = 841.8898
+
+# Registration marker centers in PDF points
+MARKER_LEFT_X = 29.0
+MARKER_RIGHT_X = 566.0
+MARKER_TOP_Y = 29.0
+MARKER_BOTTOM_Y = 812.0
+
+
+# ==========================================
 # 1. LOAD GRAYSCALE IMAGE
 # ==========================================
 
@@ -32,6 +46,14 @@ def load_grayscale_image():
 
 def detect_registration_markers(image):
 
+    if image is None:
+        raise ValueError("Input image is empty.")
+
+    if len(image.shape) != 2:
+        raise ValueError(
+            "Registration marker detection requires grayscale image."
+        )
+
     height, width = image.shape
 
     # Convert dark pixels into white foreground pixels
@@ -57,10 +79,8 @@ def detect_registration_markers(image):
 
         x, y, w, h, area = stats[index]
 
-        # Calculate width-to-height ratio
         aspect_ratio = w / float(h)
 
-        # Marker size and shape filtering
         minimum_area = width * height * 0.00015
         maximum_area = width * height * 0.0012
 
@@ -84,18 +104,27 @@ def detect_registration_markers(image):
             "center": (center_x, center_y)
         })
 
-    print(f"Square marker candidates found: {len(candidates)}")
+    print(
+        f"Square marker candidates found: {len(candidates)}"
+    )
 
-    # Divide the image into four corner regions
+    # Divide image into four corner regions
     corner_regions = {
-        "top_left": (0, 0, width * 0.18, height * 0.12),
-        "top_right": (width * 0.82, 0, width, height * 0.12),
+        "top_left": (
+            0, 0, width * 0.18, height * 0.12
+        ),
+
+        "top_right": (
+            width * 0.82, 0, width, height * 0.12
+        ),
+
         "bottom_right": (
             width * 0.82,
             height * 0.88,
             width,
             height
         ),
+
         "bottom_left": (
             0,
             height * 0.88,
@@ -106,7 +135,7 @@ def detect_registration_markers(image):
 
     detected = {}
 
-    # Select the largest suitable square in each corner
+    # Select largest suitable square in each corner
     for corner, (x1, y1, x2, y2) in corner_regions.items():
 
         corner_candidates = [
@@ -142,10 +171,13 @@ def detect_registration_markers(image):
 
 def draw_registration_markers(image, markers):
 
-    output = cv2.cvtColor(
-        image,
-        cv2.COLOR_GRAY2BGR
-    )
+    if len(image.shape) == 2:
+        output = cv2.cvtColor(
+            image,
+            cv2.COLOR_GRAY2BGR
+        )
+    else:
+        output = image.copy()
 
     for name, point in markers.items():
 
@@ -178,7 +210,7 @@ def draw_registration_markers(image, markers):
 
 def correct_perspective(image, markers):
 
-    height, width = image.shape
+    height, width = image.shape[:2]
 
     # Source points in clockwise order
     source_points = np.array([
@@ -188,38 +220,103 @@ def correct_perspective(image, markers):
         markers["bottom_left"]
     ], dtype=np.float32)
 
-    # Target marker centers for the standard page
-    margin_x = width * 0.037
-    margin_y = height * 0.026
-
+    # Map marker centers to original template geometry
     destination_points = np.array([
-        [margin_x, margin_y],
-        [width - margin_x, margin_y],
-        [width - margin_x, height - margin_y],
-        [margin_x, height - margin_y]
+
+        [
+            width * (MARKER_LEFT_X / PAGE_WIDTH),
+            height * (MARKER_TOP_Y / PAGE_HEIGHT)
+        ],
+
+        [
+            width * (MARKER_RIGHT_X / PAGE_WIDTH),
+            height * (MARKER_TOP_Y / PAGE_HEIGHT)
+        ],
+
+        [
+            width * (MARKER_RIGHT_X / PAGE_WIDTH),
+            height * (MARKER_BOTTOM_Y / PAGE_HEIGHT)
+        ],
+
+        [
+            width * (MARKER_LEFT_X / PAGE_WIDTH),
+            height * (MARKER_BOTTOM_Y / PAGE_HEIGHT)
+        ]
+
     ], dtype=np.float32)
 
-    # Calculate perspective transformation matrix
+    # Calculate transformation matrix
     matrix = cv2.getPerspectiveTransform(
         source_points,
         destination_points
     )
 
-    # Apply transformation
+    # Apply perspective transformation
     aligned_image = cv2.warpPerspective(
         image,
         matrix,
-        (width, height)
+        (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=255
     )
 
     return aligned_image
 
 
 # ==========================================
-# 5. SAVE OUTPUT IMAGES
+# 5. REUSABLE IMAGE ALIGNMENT FUNCTION
+# ==========================================
+
+def align_omr_image(image):
+
+    if image is None:
+        raise ValueError(
+            "Input OMR image is empty."
+        )
+
+    # Convert input image to grayscale
+    if len(image.shape) == 3:
+
+        grayscale = cv2.cvtColor(
+            image,
+            cv2.COLOR_BGR2GRAY
+        )
+
+    elif len(image.shape) == 2:
+
+        grayscale = image.copy()
+
+    else:
+
+        raise ValueError(
+            "Unsupported image dimensions."
+        )
+
+    # Detect four registration markers
+    markers = detect_registration_markers(
+        grayscale
+    )
+
+    # Correct page rotation and perspective
+    aligned_image = correct_perspective(
+        grayscale,
+        markers
+    )
+
+    return aligned_image
+
+
+# ==========================================
+# 6. SAVE OUTPUT IMAGES
 # ==========================================
 
 def save_image(image, filename):
+
+    PROCESSED_DATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     output_path = PROCESSED_DATA_DIR / filename
 
@@ -237,12 +334,16 @@ def save_image(image, filename):
 
 
 # ==========================================
-# 6. MAIN FUNCTION
+# 7. MAIN FUNCTION
 # ==========================================
 
 def main():
 
-    print("Loading OMR grayscale image...")
+    print("=" * 45)
+    print(" SMARTOMR AI - REGISTRATION ALIGNMENT")
+    print("=" * 45)
+
+    print("\nLoading OMR grayscale image...")
 
     image = load_grayscale_image()
 
@@ -251,7 +352,9 @@ def main():
     # Detect four registration markers
     print("\nDetecting registration markers...")
 
-    markers = detect_registration_markers(image)
+    markers = detect_registration_markers(
+        image
+    )
 
     print("\nAll four registration markers detected!")
 
@@ -284,7 +387,7 @@ def main():
 
 
 # ==========================================
-# 7. EXECUTION
+# 8. EXECUTION
 # ==========================================
 
 if __name__ == "__main__":

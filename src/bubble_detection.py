@@ -2,284 +2,302 @@
 import cv2
 import numpy as np
 
-from config import PROCESSED_DATA_DIR
-
+from src.omr_structure_detector import generate_expected_bubbles
 
 
 # ==========================================
-# 1. TEMPLATE CONFIGURATION
+# SMARTOMR AI - BUBBLE CLASSIFICATION
 # ==========================================
-
-TOTAL_QUESTIONS = 100
 
 OPTIONS = ["A", "B", "C", "D"]
 
-QUESTIONS_PER_COLUMN = 50
+# Initial classification thresholds
+EMPTY_THRESHOLD = 20
+FILLED_THRESHOLD = 45
 
-# Original PDF dimensions in points (A4)
-PDF_WIDTH = 595.2756
-PDF_HEIGHT = 841.8898
-
-# Original template coordinates in PDF points
-ROW_START_Y = 645
-ROW_GAP = 10.2
-
-BUBBLE_RADIUS = 4.5
-
-COLUMN_STARTS = [48, 310]
-
-BUBBLE_OFFSETS = [90, 124, 158, 192]
-
-EMPTY_THRESHOLD = 20.0
-FILLED_THRESHOLD = 45.0
-
+PIXEL_THRESHOLD = 150
 
 
 # ==========================================
-# 2. LOAD ALIGNED OMR IMAGE
+# 1. CALCULATE BUBBLE FILL PERCENTAGE
 # ==========================================
 
+def calculate_fill_percentage(gray, bubble):
+    """
+    Calculate the percentage of dark pixels
+    inside the bubble, excluding its outline.
+    """
 
-def load_omr_image():
+    height, width = gray.shape[:2]
 
-    image_path = PROCESSED_DATA_DIR / "omr_grayscale.png"
+    center_x = bubble["x"]
+    center_y = bubble["y"]
+    radius = bubble["radius"]
 
-    image = cv2.imread(
-        str(image_path),
-        cv2.IMREAD_GRAYSCALE
-    )
+    # Use the inner area to avoid counting
+    # the printed circular bubble outline.
+    inner_radius = max(2, int(radius * 0.55))
 
-    if image is None:
-        raise FileNotFoundError(
-            f"Original grayscale image not found: {image_path}"
-        )
+    x1 = max(0, center_x - inner_radius)
+    x2 = min(width, center_x + inner_radius + 1)
 
-    return image
+    y1 = max(0, center_y - inner_radius)
+    y2 = min(height, center_y + inner_radius + 1)
 
-
-
-# ==========================================
-# 3. CALCULATE BUBBLE FILL PERCENTAGE
-# ==========================================
-
-
-def calculate_fill_percentage(image, center, radius):
-
-    x, y = map(int, center)
-
-    padding = radius + 3
-
-    x1 = max(0, x - padding)
-    y1 = max(0, y - padding)
-    x2 = min(image.shape[1], x + padding + 1)
-    y2 = min(image.shape[0], y + padding + 1)
-
-    roi = image[y1:y2, x1:x2]
+    roi = gray[y1:y2, x1:x2]
 
     if roi.size == 0:
         return 0.0
 
-    # Create a circular mask excluding the outer outline
-    mask = np.zeros(roi.shape, dtype=np.uint8)
+    yy, xx = np.ogrid[y1:y2, x1:x2]
 
-    center_roi = (x - x1, y - y1)
-
-    inner_radius = max(1, int(radius * 0.65))
-
-    cv2.circle(
-        mask,
-        center_roi,
-        inner_radius,
-        255,
-        -1
+    distance_squared = (
+        (xx - center_x) ** 2 +
+        (yy - center_y) ** 2
     )
 
-    # Use a fixed threshold for dark pixel detection
-    _, binary = cv2.threshold(
-        roi,
-        150,
-        255,
-        cv2.THRESH_BINARY_INV
+    circular_mask = (
+        distance_squared <= inner_radius ** 2
     )
 
-    dark_pixels = cv2.countNonZero(
-        cv2.bitwise_and(binary, mask)
-    )
+    bubble_pixels = roi[circular_mask]
 
-    total_pixels = cv2.countNonZero(mask)
-
-    if total_pixels == 0:
+    if bubble_pixels.size == 0:
         return 0.0
 
-    return (dark_pixels / total_pixels) * 100
+    dark_pixels = np.count_nonzero(
+        bubble_pixels < PIXEL_THRESHOLD
+    )
 
+    fill_percentage = (
+        dark_pixels / bubble_pixels.size
+    ) * 100
+
+    return round(float(fill_percentage), 2)
 
 
 # ==========================================
-# 4. CLASSIFY BUBBLE
+# 2. CLASSIFY INDIVIDUAL BUBBLE
 # ==========================================
 
 def classify_bubble(fill_percentage):
+    """
+    Classify a bubble as EMPTY, FILLED or UNCERTAIN.
+    """
 
     if fill_percentage < EMPTY_THRESHOLD:
+
         return "EMPTY"
 
     elif fill_percentage >= FILLED_THRESHOLD:
+
         return "FILLED"
 
     else:
+
         return "UNCERTAIN"
 
 
 # ==========================================
-# 5. DETECT ONE QUESTION
+# 3. ANALYZE ALL BUBBLES
 # ==========================================
 
+def detect_all_bubbles(image):
+    """
+    Analyze all 400 expected bubble positions
+    using the standard OMR template geometry.
+    """
 
+    if image is None:
+        raise ValueError("Input image is empty.")
 
-def detect_question(image, question_number):
+    if len(image.shape) == 2:
 
-    height, width = image.shape
-
-    # Convert PDF points into image pixels
-    scale_x = width / PDF_WIDTH
-    scale_y = height / PDF_HEIGHT
-
-    if question_number <= 50:
-
-        column_start = COLUMN_STARTS[0]
-        row_index = question_number - 1
+        gray = image.copy()
 
     else:
 
-        column_start = COLUMN_STARTS[1]
-        row_index = question_number - 51
-
-    # PDF coordinates use bottom-left origin
-    y_pdf = ROW_START_Y - (row_index * ROW_GAP)
-
-    results = {}
-
-    for option, offset in zip(OPTIONS, BUBBLE_OFFSETS):
-
-        x_pdf = column_start + offset
-
-        # Convert PDF coordinates to OpenCV pixel coordinates
-        x_pixel = int(round(x_pdf * scale_x))
-        y_pixel = int(round((PDF_HEIGHT - y_pdf) * scale_y))
-
-        radius_x = int(round(BUBBLE_RADIUS * scale_x))
-        radius_y = int(round(BUBBLE_RADIUS * scale_y))
-
-        fill_percentage = calculate_fill_percentage(
+        gray = cv2.cvtColor(
             image,
-            (x_pixel, y_pixel),
-            min(radius_x, radius_y)
+            cv2.COLOR_BGR2GRAY
         )
 
-        classification = classify_bubble(fill_percentage)
+    expected_bubbles = generate_expected_bubbles(
+        gray.shape
+    )
 
-        results[option] = {
-            "fill_percentage": round(fill_percentage, 2),
-            "status": classification
-        }
+    detected_bubbles = []
 
-    return results
+    for bubble in expected_bubbles:
+
+        fill_percentage = calculate_fill_percentage(
+            gray,
+            bubble
+        )
+
+        status = classify_bubble(
+            fill_percentage
+        )
+
+        detected_bubbles.append({
+            "question_number": bubble["question_number"],
+            "column": bubble["column"],
+            "option": bubble["option"],
+            "x": bubble["x"],
+            "y": bubble["y"],
+            "fill_percentage": fill_percentage,
+            "status": status
+        })
+
+    return detected_bubbles
 
 
 # ==========================================
-# 6. EXTRACT ANSWER
+# 4. EXTRACT ANSWER FOR EACH QUESTION
 # ==========================================
 
 def extract_answer(bubble_results):
+    """
+    Determine the answer for one question.
+    """
 
     filled_options = [
-        option
-        for option, result in bubble_results.items()
-        if result["status"] == "FILLED"
+        bubble["option"]
+        for bubble in bubble_results
+        if bubble["status"] == "FILLED"
     ]
 
     uncertain_options = [
-        option
-        for option, result in bubble_results.items()
-        if result["status"] == "UNCERTAIN"
+        bubble["option"]
+        for bubble in bubble_results
+        if bubble["status"] == "UNCERTAIN"
     ]
 
+    # Uncertain marks require human review
     if uncertain_options:
+
         return "REVIEW_REQUIRED"
 
-    if len(filled_options) == 0:
-        return "UNANSWERED"
-
+    # Multiple marked bubbles
     if len(filled_options) > 1:
+
         return "MULTIPLE_MARKS"
 
+    # No marked bubble
+    if len(filled_options) == 0:
+
+        return "UNANSWERED"
+
+    # Exactly one marked bubble
     return filled_options[0]
 
 
 # ==========================================
-# 7. DETECT ALL QUESTIONS
+# 5. DETECT ALL ANSWERS
 # ==========================================
 
 def detect_all_answers(image):
+    """
+    Extract answers for all 100 questions.
 
-    answers = {}
+    Returns a dictionary containing the answer
+    and individual bubble measurements.
+    """
 
-    for question_number in range(1, TOTAL_QUESTIONS + 1):
+    bubble_results = detect_all_bubbles(image)
 
-        bubble_results = detect_question(
-            image,
-            question_number
+    question_results = {}
+
+    for question_number in range(1, 101):
+
+        question_bubbles = [
+            bubble
+            for bubble in bubble_results
+            if bubble["question_number"] == question_number
+        ]
+
+        question_bubbles.sort(
+            key=lambda bubble: OPTIONS.index(bubble["option"])
         )
 
-        answer = extract_answer(
-            bubble_results
-        )
+        answer = extract_answer(question_bubbles)
 
-        answers[question_number] = {
+        question_results[question_number] = {
             "answer": answer,
-            "bubbles": bubble_results
+            "bubbles": question_bubbles
         }
 
-    return answers
+    return question_results
 
 
 # ==========================================
-# 8. MAIN FUNCTION
+# 6. PRINT ANSWER EXTRACTION RESULTS
 # ==========================================
 
-def main():
+def print_detection_results(results):
+    """
+    Print extracted answers and summary counts.
+    """
 
-    print("Loading aligned OMR sheet...")
+    correct_format = []
 
-    image = load_omr_image()
+    for question_number, result in results.items():
 
-    print("OMR sheet loaded successfully!")
+        answer = result["answer"]
 
-    print("\nStarting bubble detection...")
+        correct_format.append(
+            (question_number, answer)
+        )
 
-    answers = detect_all_answers(image)
+    print("\n===================================")
+    print(" SMARTOMR AI - ANSWER EXTRACTION")
+    print("===================================")
 
-    for question_number, result in answers.items():
+    for question_number, answer in correct_format:
 
-        print(f"Q{question_number}: {result['answer']}")
+        print(f"Question {question_number}: {answer}")
 
-        # Show individual bubble measurements for first 10 questions
-        if question_number <= 10:
+    answered = sum(
+        1 for _, answer in correct_format
+        if answer in OPTIONS
+    )
 
-            for option, details in result["bubbles"].items():
+    unanswered = sum(
+        1 for _, answer in correct_format
+        if answer == "UNANSWERED"
+    )
 
-                print(
-                    f"    {option}: "
-                    f"{details['fill_percentage']}% "
-                    f"({details['status']})"
-                )
+    multiple_marks = sum(
+        1 for _, answer in correct_format
+        if answer == "MULTIPLE_MARKS"
+    )
 
-    print("\nBubble detection completed!")
+    review_required = sum(
+        1 for _, answer in correct_format
+        if answer == "REVIEW_REQUIRED"
+    )
+
+    print("\n========== SUMMARY ==========")
+
+    print("Total Questions:", len(results))
+    print("Answered:", answered)
+    print("Unanswered:", unanswered)
+    print("Multiple Marks:", multiple_marks)
+    print("Review Required:", review_required)
+
+    print("=============================")
+
 
 # ==========================================
-# 9. EXECUTION
+# 7. MODULE TEST
 # ==========================================
 
 if __name__ == "__main__":
-    main()
+
+    print("===================================")
+    print("          SMARTOMR AI")
+    print("       BUBBLE DETECTOR")
+    print("===================================")
+
+    print("Bubble classification module loaded.")
+    print("Ready for answer extraction.")

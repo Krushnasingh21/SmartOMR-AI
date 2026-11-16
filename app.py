@@ -1,6 +1,12 @@
 
 import streamlit as st
 import pandas as pd
+import cv2
+import numpy as np
+import tempfile
+import os
+
+from pathlib import Path
 
 from config import (
     APP_TITLE,
@@ -9,7 +15,10 @@ from config import (
     create_required_directories
 )
 
-# Exam management functions
+# ==========================================
+# DATABASE IMPORTS
+# ==========================================
+
 from database.exam_manager import (
     create_exam,
     get_all_exams,
@@ -17,7 +26,6 @@ from database.exam_manager import (
     delete_exam
 )
 
-# Student management functions
 from database.student_manager import (
     create_student,
     get_all_students,
@@ -26,7 +34,6 @@ from database.student_manager import (
     delete_student
 )
 
-# Answer key management functions
 from database.answer_key_manager import (
     create_answer_key,
     get_answer_key,
@@ -34,6 +41,12 @@ from database.answer_key_manager import (
     update_answer_key,
     delete_answer_key
 )
+
+# ==========================================
+# OMR PIPELINE IMPORT
+# ==========================================
+
+from src.omr_pipeline import process_omr
 
 
 # ==========================================
@@ -50,7 +63,229 @@ create_required_directories()
 
 
 # ==========================================
-# 2. SIDEBAR NAVIGATION
+# 2. HELPER FUNCTIONS
+# ==========================================
+
+def get_answer_dataframe(detected_answers):
+
+    rows = []
+
+    for question, answer in sorted(detected_answers.items()):
+
+        if answer == "UNANSWERED":
+            status = "Unanswered"
+
+        elif answer == "REVIEW_REQUIRED":
+            status = "Review Required"
+
+        elif answer == "MULTIPLE_MARKS":
+            status = "Multiple Marks"
+
+        else:
+            status = "Answered"
+
+        rows.append({
+            "Question": question,
+            "Detected Answer": answer,
+            "Status": status
+        })
+
+    return pd.DataFrame(rows)
+
+
+def display_omr_result(result, exam_name=None, student_name=None):
+
+    if not result:
+        st.info("No OMR result available.")
+        return
+
+    evaluation = result.get("evaluation")
+
+    detected_answers = result.get("detected_answers", {})
+
+    structure = result.get("structure", {})
+
+    st.divider()
+
+    st.subheader("OMR Processing Summary")
+
+    if exam_name:
+        st.write(f"**Examination:** {exam_name}")
+
+    if student_name:
+        st.write(f"**Student:** {student_name}")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric(
+        "Total Questions",
+        len(detected_answers)
+    )
+
+    answered_count = sum(
+        1 for answer in detected_answers.values()
+        if answer not in (
+            "UNANSWERED",
+            "REVIEW_REQUIRED",
+            "MULTIPLE_MARKS"
+        )
+    )
+
+    unanswered_count = sum(
+        1 for answer in detected_answers.values()
+        if answer == "UNANSWERED"
+    )
+
+    review_count = sum(
+        1 for answer in detected_answers.values()
+        if answer in (
+            "REVIEW_REQUIRED",
+            "MULTIPLE_MARKS"
+        )
+    )
+
+    col2.metric("Answered", answered_count)
+    col3.metric("Unanswered", unanswered_count)
+    col4.metric("Review Required", review_count)
+
+    # --------------------------------------
+    # EVALUATION RESULT
+    # --------------------------------------
+
+    if evaluation:
+
+        st.subheader("Examination Result")
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric(
+            "Final Score",
+            f"{evaluation['score']} / {evaluation['maximum_marks']}"
+        )
+
+        col2.metric(
+            "Percentage",
+            f"{evaluation['percentage']}%"
+        )
+
+        col3.metric(
+            "Correct",
+            evaluation["correct"]
+        )
+
+        col4.metric(
+            "Incorrect",
+            evaluation["incorrect"]
+        )
+
+        result_data = {
+            "Category": [
+                "Correct",
+                "Incorrect",
+                "Unanswered",
+                "Review Required"
+            ],
+            "Count": [
+                evaluation["correct"],
+                evaluation["incorrect"],
+                evaluation["unanswered"],
+                evaluation["review_required"]
+            ]
+        }
+
+        st.bar_chart(
+            pd.DataFrame(result_data).set_index("Category")
+        )
+
+    # --------------------------------------
+    # LAYOUT INFORMATION
+    # --------------------------------------
+
+    with st.expander("OMR Layout and Structure Details"):
+
+        layout = result.get("layout", {})
+
+        st.write(
+            "**Detected Layout:**",
+            layout.get("layout_name", "Unknown")
+        )
+
+        st.write(
+            "**Layout Confidence:**",
+            layout.get("confidence", 0)
+        )
+
+        st.write(
+            "**Expected Bubble Positions:**",
+            structure.get("expected_bubble_positions", 0)
+        )
+
+        st.write(
+            "**Detected Bubble Positions:**",
+            structure.get("detected_bubble_positions", 0)
+        )
+
+        st.write(
+            "**Complete Question Groups:**",
+            structure.get("detected_question_groups", 0)
+        )
+
+    # --------------------------------------
+    # ALIGNED IMAGE
+    # --------------------------------------
+
+    aligned_image = result.get("aligned_image")
+
+    if aligned_image is not None:
+
+        st.subheader("Aligned OMR Sheet")
+
+        display_image = cv2.cvtColor(
+            aligned_image,
+            cv2.COLOR_BGR2RGB
+        )
+
+        st.image(
+            display_image,
+            caption="Processed and aligned OMR sheet",
+            use_container_width=True
+        )
+
+    # --------------------------------------
+    # DETECTED ANSWERS
+    # --------------------------------------
+
+    st.subheader("Detected Answers")
+
+    answer_df = get_answer_dataframe(
+        detected_answers
+    )
+
+    st.dataframe(
+        answer_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # --------------------------------------
+    # CSV DOWNLOAD
+    # --------------------------------------
+
+    csv_data = answer_df.to_csv(
+        index=False
+    ).encode("utf-8")
+
+    st.download_button(
+        label="Download Detected Answers CSV",
+        data=csv_data,
+        file_name="smartomr_detected_answers.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+
+# ==========================================
+# 3. SIDEBAR NAVIGATION
 # ==========================================
 
 st.sidebar.title("📝 SmartOMR AI")
@@ -74,7 +309,7 @@ menu = st.sidebar.radio(
 
 
 # ==========================================
-# 3. DASHBOARD
+# 4. DASHBOARD
 # ==========================================
 
 if menu == "Dashboard":
@@ -89,40 +324,75 @@ if menu == "Dashboard":
     st.divider()
 
     try:
+
         total_exams = len(get_all_exams())
+
         total_students = len(get_all_students())
 
     except Exception as error:
+
         total_exams = 0
         total_students = 0
-        st.error(f"Unable to load dashboard data: {error}")
+
+        st.error(
+            f"Unable to load dashboard data: {error}"
+        )
+
+    scanned_count = int(
+        "last_omr_result" in st.session_state
+    )
 
     col1, col2, col3, col4 = st.columns(4)
 
-    col1.metric("Total Exams", total_exams)
-    col2.metric("Students", total_students)
-    col3.metric("Sheets Scanned", "0")
-    col4.metric("Results Generated", "0")
+    col1.metric(
+        "Total Exams",
+        total_exams
+    )
+
+    col2.metric(
+        "Students",
+        total_students
+    )
+
+    col3.metric(
+        "Sheets Processed This Session",
+        scanned_count
+    )
+
+    col4.metric(
+        "Results Generated This Session",
+        scanned_count
+    )
 
     st.subheader("Getting Started")
 
     st.info(
-        "Manage examinations, students and answer keys, scan OMR sheets, "
-        "and evaluate student responses using SmartOMR AI."
+        "Manage examinations, students and answer keys, "
+        "scan OMR sheets, and evaluate student responses "
+        "using SmartOMR AI."
     )
 
-    st.subheader("Development Status")
+    st.subheader("Available Modules")
 
-    st.write(
-        "Database-connected Exam Management, Student Management "
-        "and Answer Key Management are available."
-    )
+    st.write("✅ Exam Management")
 
-    st.progress(45)
+    st.write("✅ Student Management")
+
+    st.write("✅ Answer Key Management")
+
+    st.write("✅ OMR Image Processing Pipeline")
+
+    st.write("✅ Automatic Answer Extraction")
+
+    st.write("✅ Answer Evaluation")
+
+    st.write("🔄 PDF and Excel report generation - upcoming")
+
+    st.progress(65)
 
 
 # ==========================================
-# 4. EXAM MANAGEMENT
+# 5. EXAM MANAGEMENT
 # ==========================================
 
 elif menu == "Exam Management":
@@ -139,7 +409,11 @@ elif menu == "Exam Management":
         all_exams = get_all_exams()
 
     except Exception as error:
-        st.error(f"Unable to retrieve exams: {error}")
+
+        st.error(
+            f"Unable to retrieve exams: {error}"
+        )
+
         all_exams = []
 
     create_tab, view_tab, edit_tab, delete_tab = st.tabs(
@@ -151,9 +425,9 @@ elif menu == "Exam Management":
         ]
     )
 
-    # ======================================
-    # 4.1 CREATE EXAM
-    # ======================================
+    # --------------------------------------
+    # CREATE EXAM
+    # --------------------------------------
 
     with create_tab:
 
@@ -202,11 +476,14 @@ elif menu == "Exam Management":
 
                 if not exam_name.strip():
 
-                    st.warning("Please enter an exam name.")
+                    st.warning(
+                        "Please enter an exam name."
+                    )
 
                 else:
 
                     try:
+
                         result = create_exam(
                             exam_name=exam_name,
                             total_questions=int(total_questions),
@@ -223,11 +500,14 @@ elif menu == "Exam Management":
                         st.rerun()
 
                     except Exception as error:
-                        st.error(f"Unable to create exam: {error}")
 
-    # ======================================
-    # 4.2 VIEW EXAMS
-    # ======================================
+                        st.error(
+                            f"Unable to create exam: {error}"
+                        )
+
+    # --------------------------------------
+    # VIEW EXAMS
+    # --------------------------------------
 
     with view_tab:
 
@@ -255,14 +535,19 @@ elif menu == "Exam Management":
                 hide_index=True
             )
 
-            st.info(f"Total saved examinations: {len(all_exams)}")
+            st.info(
+                f"Total saved examinations: {len(all_exams)}"
+            )
 
         else:
-            st.info("No examinations found. Create your first exam.")
 
-    # ======================================
-    # 4.3 EDIT EXAM
-    # ======================================
+            st.info(
+                "No examinations found. Create your first exam."
+            )
+
+    # --------------------------------------
+    # EDIT EXAM
+    # --------------------------------------
 
     with edit_tab:
 
@@ -338,11 +623,15 @@ elif menu == "Exam Management":
                 if update_submitted:
 
                     if not updated_name.strip():
-                        st.warning("Exam name cannot be empty.")
+
+                        st.warning(
+                            "Exam name cannot be empty."
+                        )
 
                     else:
 
                         try:
+
                             result = update_exam(
                                 exam_id=selected_exam_id,
                                 exam_name=updated_name,
@@ -353,17 +642,24 @@ elif menu == "Exam Management":
                             )
 
                             st.success(result["message"])
+
                             st.rerun()
 
                         except Exception as error:
-                            st.error(f"Unable to update exam: {error}")
+
+                            st.error(
+                                f"Unable to update exam: {error}"
+                            )
 
         else:
-            st.info("No examinations available to update.")
 
-    # ======================================
-    # 4.4 DELETE EXAM
-    # ======================================
+            st.info(
+                "No examinations available to update."
+            )
+
+    # --------------------------------------
+    # DELETE EXAM
+    # --------------------------------------
 
     with delete_tab:
 
@@ -405,19 +701,30 @@ elif menu == "Exam Management":
             ):
 
                 try:
-                    result = delete_exam(selected_delete_id)
+
+                    result = delete_exam(
+                        selected_delete_id
+                    )
+
                     st.success(result["message"])
+
                     st.rerun()
 
                 except Exception as error:
-                    st.error(f"Unable to delete exam: {error}")
+
+                    st.error(
+                        f"Unable to delete exam: {error}"
+                    )
 
         else:
-            st.info("No examinations available to delete.")
+
+            st.info(
+                "No examinations available to delete."
+            )
 
 
 # ==========================================
-# 5. STUDENT MANAGEMENT
+# 6. STUDENT MANAGEMENT
 # ==========================================
 
 elif menu == "Student Management":
@@ -431,15 +738,16 @@ elif menu == "Student Management":
     st.divider()
 
     try:
+
         all_students = get_all_students()
 
     except Exception as error:
-        st.error(f"Unable to retrieve students: {error}")
-        all_students = []
 
-    # --------------------------------------
-    # STUDENT MANAGEMENT TABS
-    # --------------------------------------
+        st.error(
+            f"Unable to retrieve students: {error}"
+        )
+
+        all_students = []
 
     register_tab, view_tab, search_tab, edit_tab, delete_tab = st.tabs(
         [
@@ -451,9 +759,9 @@ elif menu == "Student Management":
         ]
     )
 
-    # ======================================
-    # 5.1 REGISTER STUDENT
-    # ======================================
+    # --------------------------------------
+    # REGISTER STUDENT
+    # --------------------------------------
 
     with register_tab:
 
@@ -485,15 +793,20 @@ elif menu == "Student Management":
 
                 if not student_name.strip():
 
-                    st.warning("Please enter the student name.")
+                    st.warning(
+                        "Please enter the student name."
+                    )
 
                 elif not roll_number.strip():
 
-                    st.warning("Please enter the roll number.")
+                    st.warning(
+                        "Please enter the roll number."
+                    )
 
                 else:
 
                     try:
+
                         result = create_student(
                             student_name=student_name,
                             roll_number=roll_number,
@@ -513,9 +826,9 @@ elif menu == "Student Management":
                             f"Unable to register student: {error}"
                         )
 
-    # ======================================
-    # 5.2 VIEW ALL STUDENTS
-    # ======================================
+    # --------------------------------------
+    # VIEW STUDENTS
+    # --------------------------------------
 
     with view_tab:
 
@@ -547,13 +860,12 @@ elif menu == "Student Management":
         else:
 
             st.info(
-                "No students registered yet. "
-                "Register your first student."
+                "No students registered yet. Register your first student."
             )
 
-    # ======================================
-    # 5.3 SEARCH STUDENTS
-    # ======================================
+    # --------------------------------------
+    # SEARCH STUDENTS
+    # --------------------------------------
 
     with search_tab:
 
@@ -567,6 +879,7 @@ elif menu == "Student Management":
         if search_query.strip():
 
             try:
+
                 search_results = search_students(search_query)
 
                 if search_results:
@@ -594,11 +907,15 @@ elif menu == "Student Management":
 
                 else:
 
-                    st.warning("No matching students found.")
+                    st.warning(
+                        "No matching students found."
+                    )
 
             except Exception as error:
 
-                st.error(f"Student search failed: {error}")
+                st.error(
+                    f"Student search failed: {error}"
+                )
 
         else:
 
@@ -606,9 +923,9 @@ elif menu == "Student Management":
                 "Enter a student name or roll number to search."
             )
 
-    # ======================================
-    # 5.4 EDIT STUDENT
-    # ======================================
+    # --------------------------------------
+    # EDIT STUDENT
+    # --------------------------------------
 
     with edit_tab:
 
@@ -659,15 +976,20 @@ elif menu == "Student Management":
 
                     if not updated_student_name.strip():
 
-                        st.warning("Student name cannot be empty.")
+                        st.warning(
+                            "Student name cannot be empty."
+                        )
 
                     elif not updated_roll_number.strip():
 
-                        st.warning("Roll number cannot be empty.")
+                        st.warning(
+                            "Roll number cannot be empty."
+                        )
 
                     else:
 
                         try:
+
                             result = update_student(
                                 student_id=selected_student_id,
                                 student_name=updated_student_name,
@@ -676,6 +998,7 @@ elif menu == "Student Management":
                             )
 
                             st.success(result["message"])
+
                             st.rerun()
 
                         except Exception as error:
@@ -686,11 +1009,13 @@ elif menu == "Student Management":
 
         else:
 
-            st.info("No students available to update.")
+            st.info(
+                "No students available to update."
+            )
 
-    # ======================================
-    # 5.5 DELETE STUDENT
-    # ======================================
+    # --------------------------------------
+    # DELETE STUDENT
+    # --------------------------------------
 
     with delete_tab:
 
@@ -734,11 +1059,13 @@ elif menu == "Student Management":
             ):
 
                 try:
+
                     result = delete_student(
                         selected_delete_student_id
                     )
 
                     st.success(result["message"])
+
                     st.rerun()
 
                 except Exception as error:
@@ -749,11 +1076,13 @@ elif menu == "Student Management":
 
         else:
 
-            st.info("No students available to delete.")
+            st.info(
+                "No students available to delete."
+            )
 
 
 # ==========================================
-# 6. ANSWER KEY MANAGEMENT
+# 7. ANSWER KEY MANAGEMENT
 # ==========================================
 
 elif menu == "Answer Key Management":
@@ -767,11 +1096,17 @@ elif menu == "Answer Key Management":
     st.divider()
 
     try:
+
         all_exams = get_all_exams()
+
         all_answer_keys = get_all_answer_keys()
 
     except Exception as error:
-        st.error(f"Unable to load answer key data: {error}")
+
+        st.error(
+            f"Unable to load answer key data: {error}"
+        )
+
         all_exams = []
         all_answer_keys = []
 
@@ -784,9 +1119,9 @@ elif menu == "Answer Key Management":
         ]
     )
 
-    # ======================================
-    # 6.1 CREATE ANSWER KEY
-    # ======================================
+    # --------------------------------------
+    # CREATE ANSWER KEY
+    # --------------------------------------
 
     with create_tab:
 
@@ -794,7 +1129,9 @@ elif menu == "Answer Key Management":
 
         if not all_exams:
 
-            st.info("Please create an examination first.")
+            st.info(
+                "Please create an examination first."
+            )
 
         else:
 
@@ -814,6 +1151,7 @@ elif menu == "Answer Key Management":
             )
 
             selected_exam = exam_lookup[selected_exam_id]
+
             existing_key = get_answer_key(selected_exam_id)
 
             if existing_key:
@@ -826,7 +1164,9 @@ elif menu == "Answer Key Management":
             else:
 
                 total_questions = selected_exam["total_questions"]
+
                 total_options = selected_exam["options_per_question"]
+
                 options = ["A", "B", "C", "D", "E"][:total_options]
 
                 st.info(
@@ -834,15 +1174,19 @@ elif menu == "Answer Key Management":
                     f"Available options: {', '.join(options)}"
                 )
 
-                st.write("Select the correct answer for each question.")
+                st.write(
+                    "Select the correct answer for each question."
+                )
 
                 with st.form("create_answer_key_form"):
 
                     answers = {}
+
                     question_columns = st.columns(4)
 
                     for question_number in range(
-                        1, total_questions + 1
+                        1,
+                        total_questions + 1
                     ):
 
                         column_index = (question_number - 1) % 4
@@ -852,7 +1196,10 @@ elif menu == "Answer Key Management":
                             selected_answer = st.selectbox(
                                 f"Question {question_number}",
                                 options=["-- Select --"] + options,
-                                key=f"create_answer_{selected_exam_id}_q_{question_number}"
+                                key=(
+                                    f"create_answer_{selected_exam_id}"
+                                    f"_q_{question_number}"
+                                )
                             )
 
                             answers[question_number] = selected_answer
@@ -887,6 +1234,7 @@ elif menu == "Answer Key Management":
                                 )
 
                                 st.success(result["message"])
+
                                 st.rerun()
 
                             except Exception as error:
@@ -895,9 +1243,9 @@ elif menu == "Answer Key Management":
                                     f"Unable to save answer key: {error}"
                                 )
 
-    # ======================================
-    # 6.2 VIEW ANSWER KEYS
-    # ======================================
+    # --------------------------------------
+    # VIEW ANSWER KEYS
+    # --------------------------------------
 
     with view_tab:
 
@@ -922,6 +1270,7 @@ elif menu == "Answer Key Management":
             )
 
             st.divider()
+
             st.subheader("View Individual Answer Key")
 
             view_exam_lookup = {
@@ -960,15 +1309,19 @@ elif menu == "Answer Key Management":
 
             else:
 
-                st.warning("The selected answer key could not be found.")
+                st.warning(
+                    "The selected answer key could not be found."
+                )
 
         else:
 
-            st.info("No answer keys have been created yet.")
+            st.info(
+                "No answer keys have been created yet."
+            )
 
-    # ======================================
-    # 6.3 EDIT ANSWER KEY
-    # ======================================
+    # --------------------------------------
+    # EDIT ANSWER KEY
+    # --------------------------------------
 
     with edit_tab:
 
@@ -1019,34 +1372,44 @@ elif menu == "Answer Key Management":
                 with st.form("edit_answer_key_form"):
 
                     updated_answers = {}
+
                     question_columns = st.columns(4)
 
                     for question_number in range(
-                        1, selected_exam["total_questions"] + 1
+                        1,
+                        selected_exam["total_questions"] + 1
                     ):
 
                         column_index = (question_number - 1) % 4
+
                         current_answer = current_key["answers"].get(
                             question_number
                         )
 
                         with question_columns[column_index]:
 
-                            # If exam settings changed and an old answer
-                            # is no longer valid, require a valid selection.
-                            select_options = options
-
                             if current_answer not in options:
+
                                 select_options = ["-- Select --"] + options
+
                                 selected_index = 0
+
                             else:
-                                selected_index = options.index(current_answer)
+
+                                select_options = options
+
+                                selected_index = options.index(
+                                    current_answer
+                                )
 
                             updated_answers[question_number] = st.selectbox(
                                 f"Question {question_number}",
                                 options=select_options,
                                 index=selected_index,
-                                key=f"edit_answer_{selected_edit_id}_q_{question_number}"
+                                key=(
+                                    f"edit_answer_{selected_edit_id}"
+                                    f"_q_{question_number}"
+                                )
                             )
 
                     update_submitted = st.form_submit_button(
@@ -1079,6 +1442,7 @@ elif menu == "Answer Key Management":
                                 )
 
                                 st.success(result["message"])
+
                                 st.rerun()
 
                             except Exception as error:
@@ -1089,11 +1453,13 @@ elif menu == "Answer Key Management":
 
         else:
 
-            st.info("No answer keys available to edit.")
+            st.info(
+                "No answer keys available to edit."
+            )
 
-    # ======================================
-    # 6.4 DELETE ANSWER KEY
-    # ======================================
+    # --------------------------------------
+    # DELETE ANSWER KEY
+    # --------------------------------------
 
     with delete_tab:
 
@@ -1134,9 +1500,12 @@ elif menu == "Answer Key Management":
 
                 try:
 
-                    result = delete_answer_key(selected_delete_id)
+                    result = delete_answer_key(
+                        selected_delete_id
+                    )
 
                     st.success(result["message"])
+
                     st.rerun()
 
                 except Exception as error:
@@ -1147,41 +1516,73 @@ elif menu == "Answer Key Management":
 
         else:
 
-            st.info("No answer keys available to delete.")
+            st.info(
+                "No answer keys available to delete."
+            )
 
 
 # ==========================================
-# 7. SCAN OMR
+# 8. SCAN OMR
 # ==========================================
 
 elif menu == "Scan OMR":
 
-    st.title("OMR Sheet Scanner")
+    st.title("📷 SmartOMR AI - OMR Scanner")
 
     st.write(
-        "Upload an OMR sheet or capture an image using your camera."
+        "Upload an OMR sheet or capture it using your camera. "
+        "SmartOMR AI will automatically detect and evaluate answers."
     )
 
+    st.divider()
+
+    # --------------------------------------
+    # SELECT INPUT METHOD
+    # --------------------------------------
+
     upload_tab, camera_tab = st.tabs(
-        ["Upload Image", "Camera"]
+        [
+            "📁 Upload OMR Sheet",
+            "📸 Camera Capture"
+        ]
     )
+
+    uploaded_file = None
+    camera_image = None
 
     with upload_tab:
 
         uploaded_file = st.file_uploader(
             "Upload OMR Sheet",
-            type=["jpg", "jpeg", "png", "bmp"]
+            type=[
+                "jpg",
+                "jpeg",
+                "png",
+                "bmp",
+                "pdf"
+            ],
+            help="Supported formats: JPG, JPEG, PNG, BMP and PDF"
         )
 
         if uploaded_file is not None:
 
-            st.image(
-                uploaded_file,
-                caption="Uploaded OMR Sheet",
-                use_container_width=True
+            st.success(
+                f"File selected: {uploaded_file.name}"
             )
 
-            st.success("Image uploaded successfully!")
+            if uploaded_file.type == "application/pdf":
+
+                st.info(
+                    "PDF selected. The first page will be processed."
+                )
+
+            else:
+
+                st.image(
+                    uploaded_file,
+                    caption="Uploaded OMR Sheet",
+                    use_container_width=True
+                )
 
     with camera_tab:
 
@@ -1191,29 +1592,359 @@ elif menu == "Scan OMR":
 
         if camera_image is not None:
 
-            st.image(
-                camera_image,
-                caption="Captured OMR Sheet",
-                use_container_width=True
+            st.success(
+                "Camera image captured successfully."
+            )
+
+    # --------------------------------------
+    # SELECT EXAMINATION
+    # --------------------------------------
+
+    st.divider()
+
+    st.subheader("Examination Configuration")
+
+    try:
+
+        available_exams = get_all_exams()
+
+        available_students = get_all_students()
+
+    except Exception as error:
+
+        st.error(
+            f"Unable to load examination or student data: {error}"
+        )
+
+        available_exams = []
+        available_students = []
+
+    if not available_exams:
+
+        st.warning(
+            "No examinations found. Please create an examination first."
+        )
+
+    else:
+
+        exam_lookup = {
+            exam["exam_id"]: exam
+            for exam in available_exams
+        }
+
+        selected_exam_id = st.selectbox(
+            "Select Examination",
+            options=list(exam_lookup.keys()),
+            format_func=lambda exam_id: (
+                f"{exam_lookup[exam_id]['exam_name']} "
+                f"({exam_lookup[exam_id]['total_questions']} Questions)"
+            ),
+            key="scan_exam_selection"
+        )
+
+        selected_exam = exam_lookup[selected_exam_id]
+
+        st.write(
+            f"**Total Questions:** {selected_exam['total_questions']}"
+        )
+
+        st.write(
+            f"**Options Per Question:** "
+            f"{selected_exam['options_per_question']}"
+        )
+
+        st.write(
+            f"**Marks Per Correct Answer:** "
+            f"{selected_exam['marks_per_correct']}"
+        )
+
+        st.write(
+            f"**Negative Marking:** "
+            f"{selected_exam['negative_marking']}"
+        )
+
+        # ----------------------------------
+        # SELECT STUDENT
+        # ----------------------------------
+
+        student_options = {
+            student["student_id"]: student
+            for student in available_students
+        }
+
+        selected_student_id = None
+
+        if student_options:
+
+            selected_student_id = st.selectbox(
+                "Select Student (Optional)",
+                options=[None] + list(student_options.keys()),
+                format_func=lambda student_id: (
+                    "Not selected"
+                    if student_id is None
+                    else (
+                        f"{student_options[student_id]['student_name']} "
+                        f"({student_options[student_id]['roll_number']})"
+                    )
+                ),
+                key="scan_student_selection"
+            )
+
+        # ----------------------------------
+        # CHECK INPUT
+        # ----------------------------------
+
+        selected_input = (
+            uploaded_file
+            if uploaded_file is not None
+            else camera_image
+        )
+
+        if uploaded_file is not None and camera_image is not None:
+
+            st.warning(
+                "Both an uploaded file and a camera image are selected. "
+                "The uploaded file will be processed."
+            )
+
+        # ----------------------------------
+        # PROCESS OMR
+        # ----------------------------------
+
+        st.divider()
+
+        if st.button(
+            "🚀 Process OMR Sheet",
+            type="primary",
+            use_container_width=True,
+            disabled=selected_input is None
+        ):
+
+            if selected_exam["total_questions"] != 100:
+
+                st.error(
+                    "The current OMR pipeline supports exactly 100 "
+                    "questions. Please select a compatible examination."
+                )
+
+            elif selected_exam["options_per_question"] != 4:
+
+                st.error(
+                    "The current OMR template supports four options "
+                    "(A, B, C, D) per question."
+                )
+
+            else:
+
+                try:
+
+                    # Retrieve saved answer key
+                    selected_key = get_answer_key(
+                        selected_exam_id
+                    )
+
+                    if not selected_key:
+
+                        st.error(
+                            "No answer key exists for this examination. "
+                            "Please create an answer key first."
+                        )
+
+                    else:
+
+                        answer_key = selected_key["answers"]
+
+                        st.info(
+                            "Starting OMR processing..."
+                        )
+
+                        progress_bar = st.progress(10)
+
+                        # ----------------------------------
+                        # PREPARE INPUT
+                        # ----------------------------------
+
+                        temporary_pdf_path = None
+
+                        try:
+
+                            file_name = getattr(
+                                selected_input,
+                                "name",
+                                "camera_capture.png"
+                            )
+
+                            file_extension = Path(
+                                file_name
+                            ).suffix.lower()
+
+                            file_bytes = selected_input.getvalue()
+
+                            if file_extension == ".pdf":
+
+                                # Save uploaded PDF temporarily
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=".pdf",
+                                    delete=False
+                                ) as temporary_file:
+
+                                    temporary_file.write(
+                                        file_bytes
+                                    )
+
+                                    temporary_pdf_path = temporary_file.name
+
+                                input_source = temporary_pdf_path
+
+                            else:
+
+                                # Decode uploaded/camera image
+                                image_array = np.frombuffer(
+                                    file_bytes,
+                                    dtype=np.uint8
+                                )
+
+                                decoded_image = cv2.imdecode(
+                                    image_array,
+                                    cv2.IMREAD_COLOR
+                                )
+
+                                if decoded_image is None:
+
+                                    raise ValueError(
+                                        "Unable to decode the uploaded image."
+                                    )
+
+                                input_source = decoded_image
+
+                            progress_bar.progress(30)
+
+                            # ----------------------------------
+                            # RUN COMPLETE OMR PIPELINE
+                            # ----------------------------------
+
+                            result = process_omr(
+                                input_source=input_source,
+                                answer_key=answer_key,
+                                marks_per_correct=float(
+                                    selected_exam["marks_per_correct"]
+                                ),
+                                marks_per_wrong=0,
+                                negative_marking=float(
+                                    selected_exam["negative_marking"]
+                                )
+                            )
+
+                            progress_bar.progress(100)
+
+                            # ----------------------------------
+                            # SAVE RESULT IN SESSION
+                            # ----------------------------------
+
+                            student_name = None
+
+                            if selected_student_id is not None:
+
+                                student_name = student_options[
+                                    selected_student_id
+                                ]["student_name"]
+
+                            st.session_state["last_omr_result"] = result
+
+                            st.session_state["last_omr_exam_name"] = (
+                                selected_exam["exam_name"]
+                            )
+
+                            st.session_state["last_omr_student_name"] = (
+                                student_name
+                            )
+
+                            st.session_state["last_omr_file_name"] = (
+                                file_name
+                            )
+
+                            st.success(
+                                "OMR processing completed successfully!"
+                            )
+
+                        finally:
+
+                            if temporary_pdf_path and os.path.exists(
+                                temporary_pdf_path
+                            ):
+
+                                os.remove(
+                                    temporary_pdf_path
+                                )
+
+                except Exception as error:
+
+                    st.error(
+                        f"OMR processing failed: {error}"
+                    )
+
+        # ----------------------------------
+        # DISPLAY CURRENT SESSION RESULT
+        # ----------------------------------
+
+        if "last_omr_result" in st.session_state:
+
+            st.divider()
+
+            st.subheader("Latest Processing Result")
+
+            st.caption(
+                f"File: {st.session_state.get('last_omr_file_name', 'Unknown')}"
+            )
+
+            display_omr_result(
+                result=st.session_state["last_omr_result"],
+                exam_name=st.session_state.get(
+                    "last_omr_exam_name"
+                ),
+                student_name=st.session_state.get(
+                    "last_omr_student_name"
+                )
             )
 
 
 # ==========================================
-# 8. RESULTS
+# 9. RESULTS
 # ==========================================
 
 elif menu == "Results":
 
-    st.title("Examination Results")
+    st.title("📊 Examination Results")
 
-    st.info(
-        "Student results and automatic answer evaluation "
-        "will be implemented in a later development phase."
+    st.write(
+        "View the latest OMR processing result generated "
+        "during this application session."
     )
+
+    st.divider()
+
+    if "last_omr_result" in st.session_state:
+
+        display_omr_result(
+            result=st.session_state["last_omr_result"],
+            exam_name=st.session_state.get(
+                "last_omr_exam_name"
+            ),
+            student_name=st.session_state.get(
+                "last_omr_student_name"
+            )
+        )
+
+    else:
+
+        st.info(
+            "No results are available in this session. "
+            "Go to Scan OMR and process an OMR sheet first."
+        )
 
 
 # ==========================================
-# 9. ABOUT PROJECT
+# 10. ABOUT PROJECT
 # ==========================================
 
 elif menu == "About Project":
@@ -1226,22 +1957,51 @@ elif menu == "About Project":
         "marked responses, evaluate answers, and generate reports."
     )
 
+    st.subheader("Core Features")
+
+    st.write("- OMR Image and PDF Upload")
+
+    st.write("- Camera-Based OMR Capture")
+
+    st.write("- OMR Layout Detection")
+
+    st.write("- Image Processing and Alignment")
+
+    st.write("- Bubble Detection and Answer Extraction")
+
+    st.write("- Automatic Answer Key Evaluation")
+
+    st.write("- Uncertain and Multiple Mark Detection")
+
+    st.write("- Examination and Student Management")
+
     st.subheader("Technology Stack")
 
     st.write("- Python")
+
     st.write("- Streamlit")
+
     st.write("- OpenCV")
+
     st.write("- NumPy and Pandas")
+
     st.write("- Scikit-learn")
+
     st.write("- SQLAlchemy")
+
     st.write("- SQLite")
 
+    st.write("- PyMuPDF")
+
+    st.write("- Plotly")
+
     st.write("Version:", PROJECT_VERSION)
+
     st.write("Project:", PROJECT_NAME)
 
 
 # ==========================================
-# 10. FOOTER
+# 11. SIDEBAR FOOTER
 # ==========================================
 
 st.sidebar.divider()
