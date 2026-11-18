@@ -1,4 +1,5 @@
-
+from src.exam_report_generator import generate_exam_results_pdf
+from src.pdf_report_generator import generate_student_result_pdf
 import streamlit as st
 import pandas as pd
 import cv2
@@ -40,6 +41,12 @@ from database.answer_key_manager import (
     get_all_answer_keys,
     update_answer_key,
     delete_answer_key
+)
+
+from database.omr_result_manager import (
+    save_omr_result,
+    get_all_results,
+    get_results_by_exam
 )
 
 # ==========================================
@@ -389,7 +396,6 @@ if menu == "Dashboard":
     st.write("🔄 PDF and Excel report generation - upcoming")
 
     st.progress(65)
-
 
 # ==========================================
 # 5. EXAM MANAGEMENT
@@ -759,7 +765,7 @@ elif menu == "Student Management":
         ]
     )
 
-    # --------------------------------------
+       # --------------------------------------
     # REGISTER STUDENT
     # --------------------------------------
 
@@ -824,9 +830,7 @@ elif menu == "Student Management":
 
                         st.error(
                             f"Unable to register student: {error}"
-                        )
-
-    # --------------------------------------
+                        )    # --------------------------------------
     # VIEW STUDENTS
     # --------------------------------------
 
@@ -1591,8 +1595,7 @@ elif menu == "Scan OMR":
         )
 
         if camera_image is not None:
-
-            st.success(
+                        st.success(
                 "Camera image captured successfully."
             )
 
@@ -1677,17 +1680,20 @@ elif menu == "Scan OMR":
         if student_options:
 
             selected_student_id = st.selectbox(
-                "Select Student (Optional)",
-                options=[None] + list(student_options.keys()),
+                "Select Student",
+                options=list(student_options.keys()),
                 format_func=lambda student_id: (
-                    "Not selected"
-                    if student_id is None
-                    else (
-                        f"{student_options[student_id]['student_name']} "
-                        f"({student_options[student_id]['roll_number']})"
-                    )
+                    f"{student_options[student_id]['student_name']} "
+                    f"({student_options[student_id]['roll_number']})"
                 ),
                 key="scan_student_selection"
+            )
+
+        else:
+
+            st.warning(
+                "No students registered. Please register a student "
+                "before processing an OMR sheet."
             )
 
         # ----------------------------------
@@ -1717,7 +1723,10 @@ elif menu == "Scan OMR":
             "🚀 Process OMR Sheet",
             type="primary",
             use_container_width=True,
-            disabled=selected_input is None
+            disabled=(
+                selected_input is None
+                or not student_options
+            )
         ):
 
             if selected_exam["total_questions"] != 100:
@@ -1838,16 +1847,49 @@ elif menu == "Scan OMR":
                             progress_bar.progress(100)
 
                             # ----------------------------------
-                            # SAVE RESULT IN SESSION
+                            # VALIDATE EVALUATION DATA
                             # ----------------------------------
 
-                            student_name = None
+                            evaluation = result.get("evaluation")
 
-                            if selected_student_id is not None:
+                            if not evaluation:
 
-                                student_name = student_options[
-                                    selected_student_id
-                                ]["student_name"]
+                                raise ValueError(
+                                    "OMR evaluation data is missing. "
+                                    "Result cannot be saved."
+                                )
+
+                            detected_answers = result.get(
+                                "detected_answers"
+                            )
+
+                            if not isinstance(detected_answers, dict):
+
+                                raise ValueError(
+                                    "Detected answers are missing "
+                                    "or have an invalid format."
+                                )
+
+                            # ----------------------------------
+                            # SAVE RESULT IN DATABASE
+                            # ----------------------------------
+
+                            student_name = student_options[
+                                selected_student_id
+                            ]["student_name"]
+
+                            save_response = save_omr_result(
+                                exam_id=selected_exam_id,
+                                student_id=selected_student_id,
+                                detected_answers=detected_answers,
+                                evaluation=evaluation
+                            )
+
+                            progress_bar.progress(100)
+
+                            # ----------------------------------
+                            # SAVE RESULT IN SESSION
+                            # ----------------------------------
 
                             st.session_state["last_omr_result"] = result
 
@@ -1863,8 +1905,18 @@ elif menu == "Scan OMR":
                                 file_name
                             )
 
+                            st.session_state["last_omr_result_id"] = (
+                                save_response["result_id"]
+                            )
+
                             st.success(
-                                "OMR processing completed successfully!"
+                                "OMR processing completed and "
+                                "result saved permanently!"
+                            )
+
+                            st.success(
+                                f"Database Result ID: "
+                                f"{save_response['result_id']}"
                             )
 
                         finally:
@@ -1880,7 +1932,7 @@ elif menu == "Scan OMR":
                 except Exception as error:
 
                     st.error(
-                        f"OMR processing failed: {error}"
+                        f"OMR processing or database saving failed: {error}"
                     )
 
         # ----------------------------------
@@ -1897,6 +1949,11 @@ elif menu == "Scan OMR":
                 f"File: {st.session_state.get('last_omr_file_name', 'Unknown')}"
             )
 
+            st.caption(
+                f"Database Result ID: "
+                f"{st.session_state.get('last_omr_result_id', 'Not available')}"
+            )
+
             display_omr_result(
                 result=st.session_state["last_omr_result"],
                 exam_name=st.session_state.get(
@@ -1909,39 +1966,484 @@ elif menu == "Scan OMR":
 
 
 # ==========================================
-# 9. RESULTS
+# 9. RESULTS DASHBOARD
 # ==========================================
 
 elif menu == "Results":
 
-    st.title("📊 Examination Results")
+    st.title("📊 Results Dashboard")
 
     st.write(
-        "View the latest OMR processing result generated "
-        "during this application session."
+        "View, filter and analyze all permanently saved "
+        "OMR examination results."
     )
 
     st.divider()
 
-    if "last_omr_result" in st.session_state:
+    # --------------------------------------
+    # FETCH SAVED RESULTS
+    # --------------------------------------
 
-        display_omr_result(
-            result=st.session_state["last_omr_result"],
-            exam_name=st.session_state.get(
-                "last_omr_exam_name"
-            ),
-            student_name=st.session_state.get(
-                "last_omr_student_name"
-            )
+    try:
+
+        all_results = get_all_results()
+
+    except Exception as error:
+
+        st.error(
+            f"Unable to retrieve saved results: {error}"
+        )
+
+        all_results = []
+
+    if not all_results:
+
+        st.info(
+            "No saved results found. "
+            "Process an OMR sheet to generate your first result."
         )
 
     else:
 
-        st.info(
-            "No results are available in this session. "
-            "Go to Scan OMR and process an OMR sheet first."
+        # ----------------------------------
+        # EXAMINATION FILTER
+        # ----------------------------------
+
+        st.subheader("Filter Results")
+
+        exam_lookup = {
+            result["exam_id"]: result["exam_name"]
+            for result in all_results
+        }
+
+        exam_options = ["All Exams"] + list(exam_lookup.keys())
+
+        selected_exam = st.selectbox(
+            "Select Examination",
+            options=exam_options,
+            format_func=lambda exam_id: (
+                exam_id
+                if exam_id == "All Exams"
+                else f"{exam_lookup[exam_id]} (ID: {exam_id})"
+            ),
+            key="results_exam_filter"
         )
 
+        if selected_exam == "All Exams":
+
+            filtered_results = all_results
+
+        else:
+
+            filtered_results = [
+                result
+                for result in all_results
+                if result["exam_id"] == selected_exam
+            ]
+
+        # ----------------------------------
+        # DASHBOARD METRICS
+        # ----------------------------------
+
+        st.divider()
+
+        st.subheader("Performance Overview")
+
+        total_students = len(filtered_results)
+
+        average_percentage = (
+            sum(
+                float(result["percentage"])
+                for result in filtered_results
+            ) / total_students
+        )
+
+        average_score = (
+            sum(
+                float(result["score"])
+                for result in filtered_results
+            ) / total_students
+        )
+
+        highest_percentage = max(
+            float(result["percentage"])
+            for result in filtered_results
+        )
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric(
+            "Total Results",
+            total_students
+        )
+
+        col2.metric(
+            "Average Percentage",
+            f"{average_percentage:.2f}%"
+        )
+
+        col3.metric(
+            "Average Score",
+            f"{average_score:.2f}"
+        )
+
+        col4.metric(
+            "Highest Percentage",
+            f"{highest_percentage:.2f}%"
+        )
+
+        # ----------------------------------
+        # RESULTS TABLE
+        # ----------------------------------
+
+        st.divider()
+
+        st.subheader("All Examination Results")
+
+        table_data = []
+
+        for result in filtered_results:
+
+            table_data.append({
+
+                "Result ID": result["result_id"],
+
+                "Exam Name": result["exam_name"],
+
+                "Student Name": result["student_name"],
+
+                "Roll Number": result["roll_number"],
+
+                "Correct": result["correct"],
+
+                "Incorrect": result["incorrect"],
+
+                "Unanswered": result["unanswered"],
+
+                "Review Required": result["review_required"],
+
+                "Score": result["score"],
+
+                "Maximum Marks": result["maximum_marks"],
+
+                "Percentage": (
+                    f"{float(result['percentage']):.2f}%"
+                )
+
+            })
+
+        results_df = pd.DataFrame(table_data)
+
+        st.dataframe(
+            results_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # ----------------------------------
+        # INDIVIDUAL RESULT DETAILS
+        # ----------------------------------
+
+        st.divider()
+
+        st.subheader("Individual Student Result")
+
+        result_lookup = {
+            result["result_id"]: result
+            for result in filtered_results
+        }
+
+        selected_result_id = st.selectbox(
+            "Select Result",
+            options=list(result_lookup.keys()),
+            format_func=lambda result_id: (
+                f"Result #{result_id} - "
+                f"{result_lookup[result_id]['student_name']} "
+                f"({result_lookup[result_id]['roll_number']})"
+            ),
+            key="individual_result_selection"
+        )
+
+        selected_result = result_lookup[selected_result_id]
+
+        st.write(
+            f"**Examination:** {selected_result['exam_name']}"
+        )
+
+        st.write(
+            f"**Student:** {selected_result['student_name']}"
+        )
+
+        st.write(
+            f"**Roll Number:** {selected_result['roll_number']}"
+        )
+
+        st.write(
+            f"**Result ID:** {selected_result['result_id']}"
+        )
+
+        # ----------------------------------
+        # INDIVIDUAL PERFORMANCE
+        # ----------------------------------
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric(
+            "Score",
+            f"{selected_result['score']} / "
+            f"{selected_result['maximum_marks']}"
+        )
+
+        col2.metric(
+            "Percentage",
+            f"{float(selected_result['percentage']):.2f}%"
+        )
+
+        col3.metric(
+            "Correct",
+            selected_result["correct"]
+        )
+
+        col4.metric(
+            "Incorrect",
+            selected_result["incorrect"]
+        )
+
+        # ----------------------------------
+        # ANSWER DETAILS
+        # ----------------------------------
+
+        st.subheader("Detected Answer Details")
+
+        detected_answers = selected_result.get(
+            "detected_answers",
+            {}
+        )
+
+        answer_rows = []
+
+        for question, answer in sorted(
+            detected_answers.items(),
+            key=lambda item: int(item[0])
+        ):
+
+            if answer == "UNANSWERED":
+
+                status = "Unanswered"
+
+            elif answer == "REVIEW_REQUIRED":
+
+                status = "Review Required"
+
+            elif answer == "MULTIPLE_MARKS":
+
+                status = "Multiple Marks"
+
+            else:
+
+                status = "Answered"
+
+            answer_rows.append({
+
+                "Question": f"Q{question}",
+
+                "Detected Answer": answer,
+
+                "Status": status
+
+            })
+
+        answer_df = pd.DataFrame(answer_rows)
+
+        st.dataframe(
+            answer_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+                # ----------------------------------
+        # EXPORT ALL RESULTS TO EXCEL
+        # ----------------------------------
+
+        st.divider()
+
+        st.subheader("Export Examination Results")
+
+        from io import BytesIO
+
+        excel_buffer = BytesIO()
+
+        with pd.ExcelWriter(
+            excel_buffer,
+            engine="openpyxl"
+        ) as writer:
+
+            results_df.to_excel(
+                writer,
+                sheet_name="Examination Results",
+                index=False
+            )
+
+            # Add performance summary
+            summary_df = pd.DataFrame({
+                "Metric": [
+                    "Total Results",
+                    "Average Percentage",
+                    "Average Score",
+                    "Highest Percentage"
+                ],
+                "Value": [
+                    total_students,
+                    round(average_percentage, 2),
+                    round(average_score, 2),
+                    round(highest_percentage, 2)
+                ]
+            })
+
+            summary_df.to_excel(
+                writer,
+                sheet_name="Performance Summary",
+                index=False
+            )
+
+        excel_buffer.seek(0)
+
+        st.download_button(
+            label="📥 Download All Results (Excel)",
+            data=excel_buffer.getvalue(),
+            file_name="SmartOMR_Examination_Results.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            use_container_width=True
+        )
+
+                # ----------------------------------
+        # EXAMINATION-WISE PDF REPORT
+        # ----------------------------------
+
+        st.divider()
+
+        st.subheader("Examination Performance PDF")
+
+        if selected_exam == "All Exams":
+
+            st.info(
+                "Select a specific examination from the filter "
+                "to generate its performance report."
+            )
+
+        else:
+
+            if st.button(
+                "📄 Generate Examination PDF Report",
+                use_container_width=True
+            ):
+
+                with st.spinner(
+                    "Generating examination PDF report..."
+                ):
+
+                    pdf_response = generate_exam_results_pdf(
+                        results=filtered_results,
+                        exam_name=exam_lookup[selected_exam]
+                    )
+
+                    if pdf_response["success"]:
+
+                        pdf_path = Path(
+                            pdf_response["file_path"]
+                        )
+
+                        pdf_bytes = pdf_path.read_bytes()
+
+                        st.success(
+                            "Examination PDF report generated successfully!"
+                        )
+
+                        st.download_button(
+                            label="📥 Download Examination PDF",
+                            data=pdf_bytes,
+                            file_name=(
+                                f"SmartOMR_Exam_Report_{selected_exam}.pdf"
+                            ),
+                            mime="application/pdf",
+                            use_container_width=True
+                        )
+
+                    else:
+
+                        st.error(
+                            f"PDF generation failed: "
+                            f"{pdf_response['message']}"
+                        )
+
+                # ----------------------------------
+        # DOWNLOAD STUDENT RESULT PDF
+        # ----------------------------------
+
+        st.divider()
+
+        st.subheader("Download Student Result Report")
+
+        if st.button(
+            "📄 Generate Student PDF Report",
+            use_container_width=True
+        ):
+
+            with st.spinner("Generating PDF report..."):
+
+                pdf_response = generate_student_result_pdf(
+                    selected_result
+                )
+
+                if pdf_response["success"]:
+
+                    pdf_path = Path(
+                        pdf_response["file_path"]
+                    )
+
+                    pdf_bytes = pdf_path.read_bytes()
+
+                    st.success(
+                        "Student PDF report generated successfully!"
+                    )
+
+                    st.download_button(
+                        label="📥 Download Student Result PDF",
+                        data=pdf_bytes,
+                        file_name=(
+                            f"SmartOMR_Result_{selected_result_id}.pdf"
+                        ),
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+
+                else:
+
+                    st.error(
+                        f"PDF generation failed: "
+                        f"{pdf_response['message']}"
+                    )
+
+        # ----------------------------------
+        # EXPORT INDIVIDUAL ANSWERS AS CSV
+        # ----------------------------------
+
+        csv_data = answer_df.to_csv(
+            index=False
+        ).encode("utf-8")
+
+        st.download_button(
+            label="📥 Download Student Answers CSV",
+            data=csv_data,
+            file_name=(
+                f"result_{selected_result_id}_answers.csv"
+            ),
+            mime="text/csv",
+            use_container_width=True
+        )
 
 # ==========================================
 # 10. ABOUT PROJECT
